@@ -9,12 +9,13 @@ import re
 from itertools import combinations
 from collections import defaultdict
 import numpy as np
+import spacy
 
 # ======================================================
 #                   CONFIG
 # ======================================================
 KNOWN_DIR = "./known_faces"
-VIDEO_SOURCE = "./video/3rd.mp4"  # Path to your video file
+VIDEO_SOURCE = "./video/3rd.mp4"
 TOLERANCE = 0.6
 SOCIAL_MEDIA = [
     "instagram", "linkedin", "youtube", "twitter", "facebook", "google",
@@ -23,65 +24,43 @@ SOCIAL_MEDIA = [
     "vimeo", "dailymotion", "researchgate", "academia"
 ]
 MAX_RESULTS_PER_QUERY = 5
+SCRAPE_TIMEOUT = 5
+
+# Load spaCy NER model (download with: python -m spacy download en_core_web_sm)
+try:
+    nlp = spacy.load("en_core_web_sm")
+    # Increase max length for processing large web pages (default is 1M characters)
+    nlp.max_length = 5000000  # 5M characters
+    print("[*] Loaded spaCy NER model for intelligent name filtering")
+except:
+    print("[!] spaCy model not found. Install with: python -m spacy download en_core_web_sm")
+    nlp = None
 
 # ======================================================
-#                   FAMILY ANALYSIS MODULE
+#               GLOBAL DATA STORAGE
 # ======================================================
-RELATION_KEYWORDS = {
-    "mother", "father", "mom", "dad",
-    "son", "daughter", "child", "kids",
-    "wife", "husband", "spouse",
-    "brother", "sister", "sibling",
-    "family", "relative", "parents"
-}
+GLOBAL_LINKS = set()
+GLOBAL_NAMES = set()
+RECOGNIZED_PERSONS = set()
+_data_lock = threading.Lock()
 
+
+# ======================================================
+#               HELPER FUNCTIONS
+# ======================================================
 
 def fetch_html(url):
+    """Fetches text content from a URL with a timeout."""
     try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        resp = requests.get(url, headers=headers, timeout=8)
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        resp = requests.get(url, headers=headers, timeout=SCRAPE_TIMEOUT)
         if resp.status_code == 200:
-            return resp.text
+            soup = BeautifulSoup(resp.text, "html.parser")
+            return soup.get_text(separator=" ", strip=True)
     except Exception:
         pass
     return ""
 
-
-def detect_relations(text, names):
-    relations = defaultdict(lambda: defaultdict(int))
-    words = text.lower()
-
-    for name in names:
-        lname = name.split()[-1].lower()
-
-        # last-name heuristic
-        for other in names:
-            if other != name and other.split()[-1].lower() == lname:
-                relations[name][other] += 2  # strong signal
-
-        # keyword heuristic (presence anywhere gives a small bonus)
-        for kw in RELATION_KEYWORDS:
-            if kw in words:
-                relations[name]["keyword_bonus"] += 1
-
-    return relations
-
-
-def score_family(relations):
-    family_groups = defaultdict(int)
-
-    for person, rel_map in relations.items():
-        for rel_person, score in rel_map.items():
-            if rel_person != "keyword_bonus":
-                pair = tuple(sorted([person, rel_person]))
-                family_groups[pair] += score
-
-    return sorted(family_groups.items(), key=lambda x: x[1], reverse=True)
-
-
-# ======================================================
-#               NAME EXTRACTION & SEARCH LOGIC
-# ======================================================
 
 def ask_yes_no(prompt):
     while True:
@@ -100,74 +79,164 @@ def all_ordered_subsets(full_name):
     return out
 
 
-def extract_names(text, target_name=""):
+# ======================================================
+#           NER-BASED NAME FILTERING (spaCy)
+# ======================================================
+
+def is_person_entity_spacy(name):
     """
-    Extracts names from text but filters out common web garbage.
-    If target_name is provided, it prioritizes names that share a part (like Surname).
+    Uses spaCy's Named Entity Recognition to determine if a name is a person.
+    Returns True if spaCy classifies it as PERSON entity.
+    Uses context to help spaCy recognize the name better.
+    """
+    if not nlp:
+        return True  # Fallback to accepting if spaCy not available
+
+    # Add context to help spaCy recognize the name
+    contexts = [
+        f"{name} is a person.",
+        f"According to {name}, the research shows...",
+        f"{name} works as a professional.",
+    ]
+
+    # Try each context
+    for context in contexts:
+        doc = nlp(context)
+        for ent in doc.ents:
+            if ent.label_ == "PERSON" and name in ent.text:
+                return True
+
+    # Fallback: If it has 2-4 capitalized words and no obvious non-person indicators, accept it
+    parts = name.split()
+    if 2 <= len(parts) <= 4:
+        # Check if all parts are capitalized
+        if all(p[0].isupper() for p in parts if p):
+            # Check it's not obviously a product/organization
+            non_person_indicators = ['mala', 'beads', 'film', 'rudraksha', 'mukhi', 'band']
+            if not any(indicator in name.lower() for indicator in non_person_indicators):
+                return True
+
+    return False
+
+
+def extract_person_names_spacy(text, min_confidence=0.5):
+    """
+    Uses spaCy NER to extract only PERSON entities from text.
+    Much more accurate than regex patterns.
+    """
+    if not nlp or not text:
+        return []
+
+    # Truncate extremely long texts to avoid memory issues
+    MAX_TEXT_LENGTH = 500000  # Process first 500k characters
+    if len(text) > MAX_TEXT_LENGTH:
+        text = text[:MAX_TEXT_LENGTH]
+
+    try:
+        # Process text with spaCy
+        doc = nlp(text)
+
+        person_names = set()
+
+        for ent in doc.ents:
+            if ent.label_ == "PERSON":
+                # Clean and validate
+                clean_name = " ".join(ent.text.split())
+
+                # Basic validation
+                if len(clean_name.split()) >= 2:  # At least 2 words
+                    if not any(char.isdigit() for char in clean_name):  # No numbers
+                        person_names.add(clean_name)
+
+        return list(person_names)
+    except Exception as e:
+        # If processing fails, return empty list
+        print(f"[!] Error processing text with spaCy: {e}")
+        return []
+
+
+def filter_related_names(names, target_name):
+    """
+    Filters extracted names to only include those related to target_name.
+    """
+    if not target_name:
+        return names
+
+    target_parts = set(p.lower() for p in target_name.split())
+    filtered = []
+
+    for name in names:
+        # Skip exact match
+        if name.lower() == target_name.lower():
+            continue
+
+        # Check if shares at least one name component
+        name_parts = set(p.lower() for p in name.split())
+        if name_parts.intersection(target_parts):
+            filtered.append(name)
+
+    return filtered
+
+
+# ======================================================
+#      HYBRID APPROACH: spaCy + Fallback Regex
+# ======================================================
+
+def extract_names(text, target_name="", use_ner=True):
+    """
+    Hybrid approach: Uses spaCy NER if available, falls back to regex.
+    """
+    if use_ner and nlp:
+        # Use spaCy NER (more accurate)
+        names = extract_person_names_spacy(text)
+        return filter_related_names(names, target_name)
+    else:
+        # Fallback to regex-based extraction
+        return extract_names_regex(text, target_name)
+
+
+def extract_names_regex(text, target_name=""):
+    """
+    Fallback regex-based name extraction with basic filtering.
     """
     if not text:
         return []
 
-    # 1. STRICTER REGEX: Require at least 2 parts (First Last), max 3 parts.
-    # Excludes single words like "About", "Acoustic", "Affiliation".
-    pattern = r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\b'
+    pattern = r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\b'
     candidates = re.findall(pattern, text)
 
-    # 2. EXPANDED BLOCKLIST: Common web/academic/business terms to ignore
+    # Minimal bad keywords (since we're using this as fallback)
     bad_keywords = {
-        "Google", "Search", "Result", "Login", "Home", "Website",
-        "Instagram", "LinkedIn", "Facebook", "YouTube", "Twitter",
-        "Profile", "View", "Contact", "About", "News", "Video", "Image",
-        "Privacy", "Policy", "Terms", "Service", "Content", "Menu",
-        "University", "College", "School", "Department", "Institute",
-        "Engineering", "Technology", "Science", "Physics", "Chemistry",
-        "Biology", "Project", "Report", "Card", "Credit", "Debit",
-        "Official", "Page", "Group", "Public", "Private", "Limited",
-        "Music", "Song", "Lyrics", "Download", "Free", "Pdf", "File",
-        "Best", "Top", "List", "Guide", "Review", "Rating", "Map",
-        "Location", "Place", "Business", "Company", "System", "Program",
-        "Application", "Software", "Hardware", "Network", "Server",
-        "Database", "Cloud", "Internet", "Mobile", "Phone", "Email",
-        "Address", "City", "State", "Country", "World", "Time", "Date",
+        "Google", "Search", "Login", "Instagram", "LinkedIn", "Facebook",
+        "YouTube", "Twitter", "University", "College", "Institute",
+        "Hospital", "Restaurant", "Hotel", "Company", "Corporation",
         "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
         "January", "February", "March", "April", "May", "June", "July",
-        "August", "September", "October", "November", "December",
-        "Cuisine", "Restaurant", "Hotel", "Hospital", "Medical", "Center",
-        "United", "States", "Kingdom", "India", "Indian", "American",
-        "General", "High", "Low", "Medium", "Small", "Large", "Big",
-        "Semester", "Syllabus", "Exam", "Result", "Merit", "Board",
-        "Council", "Commission", "Ministry", "Govt", "Government",
-        "Officer", "Manager", "Director", "President", "Secretary",
-        "Archive", "Category", "Post", "Comment", "Share", "Follow",
-        "Forgot", "Password", "Username", "Sign", "Up", "Log", "In"
+        "August", "September", "October", "November", "December"
     }
 
     unique_names = set()
-
-    # Pre-compute target parts for relevance checking
     target_parts = set(p.lower() for p in target_name.split()) if target_name else set()
 
     for name in candidates:
-        # Clean up whitespace
         clean_name = " ".join(name.split())
-
-        # Check against bad keywords (if any part of the name is in bad_keywords)
         name_parts = clean_name.split()
+
+        # Basic filtering
         if any(part in bad_keywords for part in name_parts):
             continue
 
-        # 3. RELEVANCE FILTER:
-        # If we have a target name, valid candidates MUST share a name part (Surname/Middle)
-        # OR be a very clean 2-3 word name that doesn't look like an entity.
-        if target_parts:
-            # Check intersection of lowercase parts
-            candidate_parts_lower = set(p.lower() for p in name_parts)
+        if len(name_parts) < 2 or len(name_parts) > 4:
+            continue
 
-            # Match only if they share a name (e.g., "Shende")
+        if any(char.isdigit() for char in clean_name):
+            continue
+
+        # Target filtering
+        if target_parts:
+            candidate_parts_lower = set(p.lower() for p in name_parts)
             if not candidate_parts_lower.intersection(target_parts):
                 continue
-
-                # Skip if it is the target person themselves (exact match)
             if clean_name.lower() == target_name.lower():
                 continue
 
@@ -176,14 +245,23 @@ def extract_names(text, target_name=""):
     return list(unique_names)
 
 
+# ======================================================
+#               SEARCH LOGIC
+# ======================================================
+
 def search_person(name, api_key, use_substrings, use_quotes):
-    """Search the name on SerpAPI and extract social links + correlated names."""
+    """Search the name on SerpAPI, print links, and STORE them for analysis."""
     if use_substrings:
         queries = all_ordered_subsets(name)
     else:
         queries = [name]
 
-    correlated_names = set()  # Store detected related names
+    local_found_names = set()
+
+    # Store this as a recognized person
+    with _data_lock:
+        GLOBAL_NAMES.add(name)
+        RECOGNIZED_PERSONS.add(name)
 
     for q in queries:
         query_str = f'"{q}"' if use_quotes else q
@@ -210,18 +288,25 @@ def search_person(name, api_key, use_substrings, use_quotes):
                     continue
                 seen_links.add(link)
 
-                # classify link
+                # Store Link for Post-Analysis
+                with _data_lock:
+                    GLOBAL_LINKS.add(link)
+
+                # Classify for printing
                 if any(sm in link.lower() for sm in SOCIAL_MEDIA):
                     social_links.append((title, link))
                 else:
                     other_links.append((title, link))
 
-                # === FILTERED NAME EXTRACTION ===
-                # We pass 'name' as target_name to ensure we only get names related to the target
-                correlated_names.update(extract_names(title, target_name=name))
-                correlated_names.update(extract_names(snippet, target_name=name))
+                # Extract Names using NER
+                extracted = extract_names(title + " " + snippet, target_name=name, use_ner=True)
+                local_found_names.update(extracted)
 
-            # print links
+                # Store Names for Post-Analysis
+                with _data_lock:
+                    GLOBAL_NAMES.update(extracted)
+
+            # Print links
             if social_links:
                 print("\n✅ Social Media Links:")
                 for title, link in social_links[:MAX_RESULTS_PER_QUERY]:
@@ -232,10 +317,9 @@ def search_person(name, api_key, use_substrings, use_quotes):
                 for title, link in other_links[:MAX_RESULTS_PER_QUERY]:
                     print(f"   - {title}: {link}")
 
-    # ---------- FINAL CORRELATED NAMES OUTPUT ----------
-    if correlated_names:
-        print(f"\n🔗 Possible Family / Associates of {name}:")
-        for n in sorted(correlated_names):
+    if local_found_names:
+        print(f"\n🔗 Possible Associates detected for {name}:")
+        for n in sorted(local_found_names):
             print("   -", n)
     else:
         print("\n[!] No additional related names detected.")
@@ -247,6 +331,112 @@ def async_search(name, api_key, use_substrings, use_quotes):
     thread = threading.Thread(target=lambda: search_person(name, api_key, use_substrings, use_quotes))
     thread.daemon = True
     thread.start()
+
+
+# ======================================================
+#           POST-ANALYSIS: CORRELATION ENGINE
+# ======================================================
+
+def analyze_correlations():
+    """
+    Scrapes collected links and checks co-occurrences using NER.
+    """
+    print("\n" + "=" * 60)
+    print("   [POST-ANALYSIS] CHECKING NAME CO-OCCURRENCES")
+    print("=" * 60)
+
+    with _data_lock:
+        all_links = list(GLOBAL_LINKS)
+        all_names = list(GLOBAL_NAMES)
+        recognized = list(RECOGNIZED_PERSONS)
+
+    if not all_links:
+        print("[!] No links collected to analyze.")
+        return
+
+    # Validate names using spaCy
+    if nlp:
+        validated_names = [n for n in all_names if is_person_entity_spacy(n)]
+        print(f"[*] Validated {len(validated_names)}/{len(all_names)} names as persons using NER")
+
+        # Debug: Show which names were filtered out
+        if len(validated_names) < len(all_names):
+            filtered_out = set(all_names) - set(validated_names)
+            print(f"[DEBUG] Filtered out non-person names:")
+            for name in filtered_out:
+                print(f"  ✗ {name}")
+    else:
+        validated_names = all_names
+        print(f"[*] Using {len(validated_names)} names (NER not available)")
+
+    # If we have recognized persons but validation filtered them, use all names
+    if len(validated_names) < 2 and len(recognized) >= 2:
+        print("[!] Validation too strict - using all extracted names instead")
+        validated_names = all_names
+
+    if len(validated_names) < 2:
+        print("[!] Not enough person names found to calculate correlations.")
+        return
+
+    print(f"[*] Scraping {len(all_links)} pages to cross-reference names...")
+
+    scores = defaultdict(int)
+    processed_count = 0
+
+    for link in all_links:
+        processed_count += 1
+
+        page_text = fetch_html(link)
+        if not page_text:
+            continue
+
+        # Extract persons from page using NER
+        if nlp:
+            page_persons = extract_person_names_spacy(page_text)
+        else:
+            page_persons = []
+
+        # Also check for our known names
+        present_names = []
+        for name in validated_names:
+            if name in page_text or name in page_persons:
+                present_names.append(name)
+
+        # Calculate correlations
+        if len(present_names) >= 2:
+            for n1, n2 in combinations(present_names, 2):
+                pair = tuple(sorted((n1, n2)))
+                scores[pair] += 1
+
+        # Progress update
+        if processed_count % 10 == 0:
+            print(f"    ... Analyzed {processed_count}/{len(all_links)} pages | Matches so far: {len(scores)} pairs")
+
+    # Filter: only show pairs involving recognized persons
+    filtered_scores = {
+        pair: score for pair, score in scores.items()
+        if any(name in recognized for name in pair)
+    }
+
+    sorted_scores = sorted(filtered_scores.items(), key=lambda x: x[1], reverse=True)
+
+    print("\n" + "=" * 60)
+    print("   CORRELATION REPORT (NER-Validated Persons)")
+    print("=" * 60)
+
+    if not sorted_scores:
+        print("[-] No significant human connections found.")
+    else:
+        print(f"{'Name A':<35} | {'Name B':<35} | {'Score'}")
+        print("-" * 80)
+        for (n1, n2), score in sorted_scores:
+            n1_display = f"{n1}*" if n1 in recognized else n1
+            n2_display = f"{n2}*" if n2 in recognized else n2
+            print(f"{n1_display:<35} <--> {n2_display:<35} : {score}")
+
+        print("\n* = Recognized from video")
+
+    print(f"\n[+] Analysis Complete. {len(validated_names)} persons, {len(sorted_scores)} correlations.")
 
 
 # ======================================================
@@ -282,14 +472,11 @@ def main():
                     known_encodings.append(encs[0])
                     known_names.append(person_name)
                     print(f"  [+] Loaded {person_name} <- {fname}")
-                else:
-                    print(f"  [!] No face found in {fname}, skipping")
             except Exception as e:
                 print(f"  [!] Error loading {fname}: {e}")
 
     print(f"[*] Total encodings loaded: {len(known_encodings)}")
 
-    # Video Capture
     cap = cv2.VideoCapture(VIDEO_SOURCE)
     if not cap.isOpened():
         print(f"[!] Cannot open video source: {VIDEO_SOURCE}")
@@ -297,17 +484,14 @@ def main():
 
     queried_names = set()
 
-    print("[*] Starting video. Press 'q' to quit.")
+    print("[*] Starting video. Press 'q' to Quit and Start Analysis.")
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        # Process frame
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-        # Optimize by processing smaller frames if needed, but here we do full frame
         face_locations = face_recognition.face_locations(rgb)
         face_encodings = face_recognition.face_encodings(rgb, face_locations)
 
@@ -319,13 +503,11 @@ def main():
                 if dists[min_idx] <= TOLERANCE:
                     name = known_names[min_idx]
 
-            # Draw box and label
             color = (0, 255, 0) if name != "Unknown" else (0, 0, 255)
             cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
             cv2.putText(frame, name, (left, max(top - 10, 10)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-            # Trigger OSINT Search (Once per person per session)
             if name != "Unknown" and api_key and name not in queried_names:
                 print(f"\n[OSINT] Recognized: {name}")
                 async_search(name, api_key, use_substrings, use_quotes)
@@ -333,12 +515,13 @@ def main():
 
         cv2.imshow("Face Recognition + OSINT", frame)
 
-        # Exit on 'q'
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
     cap.release()
     cv2.destroyAllWindows()
+
+    analyze_correlations()
 
 
 if __name__ == "__main__":
